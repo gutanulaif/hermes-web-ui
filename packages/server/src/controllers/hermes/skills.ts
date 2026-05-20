@@ -136,33 +136,45 @@ async function scanSkillsDir(skillsDir: string, bundledManifest: Map<string, str
     const catDir = join(skillsDir, cat.name)
     const subEntries = await readdir(catDir, { withFileTypes: true })
     const skills: any[] = []
-    for (const se of subEntries) {
-      if (!se.isDirectory()) continue
-      const skillMd = await safeReadFile(join(catDir, se.name, 'SKILL.md'))
-      if (skillMd) {
-        const source = getSkillSource(se.name, bundledManifest, hubNames)
-        let modified = false
-        if (source === 'builtin') {
-          const manifestHash = bundledManifest.get(se.name)
-          if (manifestHash) {
-            const currentHash = await dirHash(join(catDir, se.name))
-            modified = currentHash !== manifestHash
+    // Recursively collect skills from subdirectories (supports nested sub-categories)
+    async function collectSkills(dir: string): Promise<any[]> {
+      const entries = await readdir(dir, { withFileTypes: true })
+      const results: any[] = []
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        const entryPath = join(dir, entry.name)
+        const skillMd = await safeReadFile(join(entryPath, 'SKILL.md'))
+        if (skillMd) {
+          const source = getSkillSource(entry.name, bundledManifest, hubNames)
+          let modified = false
+          if (source === 'builtin') {
+            const manifestHash = bundledManifest.get(entry.name)
+            if (manifestHash) {
+              const currentHash = await dirHash(entryPath)
+              modified = currentHash !== manifestHash
+            }
           }
+          const usage = usageStats.get(entry.name)
+          results.push({
+            name: entry.name,
+            description: extractDescription(skillMd),
+            enabled: !disabledList.includes(entry.name),
+            source,
+            modified: modified || undefined,
+            patchCount: usage?.patch_count,
+            useCount: usage?.use_count,
+            viewCount: usage?.view_count,
+            pinned: usage?.pinned || undefined,
+          })
+        } else {
+          // No SKILL.md — might be a sub-category container, recurse deeper
+          const subResults = await collectSkills(entryPath)
+          results.push(...subResults)
         }
-        const usage = usageStats.get(se.name)
-        skills.push({
-          name: se.name,
-          description: extractDescription(skillMd),
-          enabled: !disabledList.includes(se.name),
-          source,
-          modified: modified || undefined,
-          patchCount: usage?.patch_count,
-          useCount: usage?.use_count,
-          viewCount: usage?.view_count,
-          pinned: usage?.pinned || undefined,
-        })
       }
+      return results
     }
+    skills.push(...await collectSkills(catDir))
     if (skills.length > 0) {
       categories.push({ name: cat.name, description: cat.description, skills })
     }
@@ -281,9 +293,42 @@ export async function listFiles(ctx: any) {
   const { category, skill } = ctx.params
   const hd = getHermesDir()
   // Handle "misc" category: real skill dir is skills/<skill>, not skills/misc/<skill>
-  const realDir = category === 'misc' ? skill : join(category, skill)
-  const skillDir = join(hd, 'skills', realDir)
+  if (category === 'misc') {
+    const skillDir = join(hd, 'skills', skill)
+    try {
+      const allFiles = await listFilesRecursive(skillDir, '')
+      const files = allFiles.filter(f => f.path !== 'SKILL.md')
+      ctx.body = { files }
+    } catch (err: any) {
+      ctx.status = 500
+      ctx.body = { error: err.message }
+    }
+    return
+  }
+  // For named categories, recursively search for the skill directory
+  // (supports nested sub-categories like mlops/evaluation/lm-evaluation-harness)
   try {
+    async function findSkillDir(dir: string): Promise<string | null> {
+      const entries = await readdir(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        const fullPath = join(dir, entry.name)
+        if (entry.name === skill) {
+          const skillMd = await safeReadFile(join(fullPath, 'SKILL.md'))
+          if (skillMd) return fullPath
+        }
+        const found = await findSkillDir(fullPath)
+        if (found) return found
+      }
+      return null
+    }
+    const catDir = join(hd, 'skills', category)
+    const skillDir = await findSkillDir(catDir)
+    if (!skillDir) {
+      ctx.status = 404
+      ctx.body = { error: 'Skill not found' }
+      return
+    }
     const allFiles = await listFilesRecursive(skillDir, '')
     const files = allFiles.filter(f => f.path !== 'SKILL.md')
     ctx.body = { files }
